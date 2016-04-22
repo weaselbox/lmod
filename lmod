@@ -1,0 +1,605 @@
+#!/usr/bin/perl -w
+#  
+# because using ldapmodify sucks
+# 
+# orginal version early 2000s - Daniel
+# updated: 2016.04.06 - general cleanup added host specific
+#   rc file handling
+#
+# rcfile format:
+# ATTRIB:VALUE (no spaces) lines starting with # are ignored
+#
+# LDAPHOST:ldap.example.com
+# LDAPBASE:dc=example,dc=com
+# BINDDN:uid=some_dude,ou=people,dc=example,dc=com
+# BINDPASS:pa55w0rd!
+#
+# if -h foobar is specified on the command line it will check
+# for ~/.config/lmodrc.foobar before falling back to 
+# ~/.config/lmodrc
+#
+# Basic usage: 
+# lmod [-h host][-b searchbase][filter][operation][attribute][value]
+# it will fall back to interactive mode if there is insufficient
+# information to complete the operation.
+
+use strict;
+
+use Net::LDAP;
+use Net::LDAP::LDIF;
+use Net::LDAP::Entry;
+use Net::LDAP::Constant qw(LDAP_EXTENSION_START_TLS);
+use Net::LDAP::Util qw(ldap_error_name);
+use Net::LDAP::Util qw(ldap_error_text);
+use Net::LDAP::Util qw(ldap_error_desc);
+use Env qw(HOME);
+
+# These two are 100% optional.  They will only 
+# be referenced if the user has not provided
+# values in an rc file or on the commandline.
+my $defaultbase = "dc=example,dc=com";
+my $defaulthost = "ldap.example.com";
+
+# yay! global vars make shit easy :)
+
+my $attrib = "";
+my $binddn = "";
+my $bindpass = "";
+my $configbase = "$HOME/.config/lmodrc";
+my $entry = "";
+my $filter = "";
+my $hostarg = "";
+my $help = 0;
+my $input = "";
+my $ldap = "";
+my $ldaphost = "";
+my $ldif = "";
+my $loop = 0;
+my $matches = "";
+my $mesg = "";
+my $optype = "";
+my $pager = "/usr/bin/less";
+my $quit = 0;
+my $runnow = 0;
+my $searchbase = "";
+my $show = "";
+my $value = "";
+
+
+##############################################################
+# deal with args
+# non "-" args are expected in the following order
+# [filter][operation type][attribute][value]
+#
+
+while (@ARGV) {
+    my $argtemp = shift(@ARGV);
+    if ($argtemp =~ m/-{0,2}help/) {
+        &print_cli_usage();
+        exit;
+    }
+    elsif ($argtemp =~ m/^-/) {
+        &arg_read($argtemp);
+    }
+    elsif (("$filter" eq "")&&($argtemp =~ m/=/)) {
+        $filter = $argtemp;
+        next;
+    }
+    elsif (("$optype" eq "")&&($argtemp =~ m/add|del|rep/)) {
+        $optype = $argtemp;
+        next;
+    }
+    elsif ("$attrib" eq "") {
+        $attrib = $argtemp;
+        next;
+    } 
+    elsif ("$value" eq "") {
+        $value = $argtemp;
+    } 
+}
+
+##############################################################
+#  Read LDAP config info if rc file present.
+#  This is after processing args so that we can look
+#  for a host specific rc file if the user has specified
+#  a host on the command line.
+
+#  why is this is handled outside of get_cred though?
+
+# Don't overwrite arg specified on commandline...
+if ("$hostarg" ne "") {
+    print "Using host arg provided on command line: $hostarg\n";
+    $ldaphost = $hostarg;
+}
+else {
+    $ldaphost = &getrcval("LDAPHOST");
+}
+unless (defined($ldaphost)) {
+    $ldaphost = "$defaulthost";
+}
+
+if ("$searchbase" eq "") {
+    $searchbase = &getrcval("LDAPBASE");
+}
+# above may have returned undef if rcfile is missing or 
+# attribute is not set in the rcfile
+unless (defined($searchbase)) {
+    $searchbase = "$defaultbase";
+}
+
+# Get the binddn and password, interactively if needed.
+&get_cred();
+#&do_bind();
+
+
+##############################################################
+# if we've got enough args for a job go ahead and run it.
+# otherwise it's interactive time
+#
+if (&got_job() > 0) {
+    &do_job();
+    exit;
+}
+else {
+    $loop = 1;    
+    $help = 1;
+}
+
+while ($loop) {
+    $runnow = 0;
+    $show = "";
+    if ($help) {
+        &print_help();
+        $help = 0;
+    }
+    &print_vars();
+    $input = &get_line();
+    &parse_line($input);
+    if ($quit) {
+        exit;
+    }
+    if ($runnow) {
+        if (&got_job) {
+            &do_job();
+        }
+        else {
+            print "Insufficient data for operation.\n";
+        }
+    }
+    if (($show)&&($searchbase)&&($filter)) {
+        &do_show();
+    }
+    elsif ($show) {
+        print "Insufficient data for operation.\n";
+    }
+}
+print "How did you get here?\n";
+exit;
+
+##############################################################
+# Subroutines
+##############################################################
+
+sub arg_read {
+    my $arg_t = shift(@_);
+
+    # process option type args
+    if ("$arg_t" eq "-b") {
+        $searchbase = shift(@ARGV);
+    }
+    elsif ("$arg_t" eq "-h") {
+        $hostarg = shift(@ARGV);
+    }
+    else {
+        print STDERR "I dunno what $_ is.\n";
+        exit;
+    }
+}
+
+sub get_line {
+    my $gl_line = "";
+    print "+> ";
+    $gl_line = <STDIN>;
+    chomp($gl_line);
+    return ($gl_line);
+}
+
+sub parse_line($) {
+    my @pl_temp = ();
+    my $pl_line = $_[0];
+    if ($pl_line =~ m/^run$/) {
+        $runnow = 1;
+    }
+    elsif ($pl_line =~ m/^(quit|q|exit|x)$/i) {
+        $quit = 1;
+    }
+    elsif ($pl_line =~ m/^help$/i) {
+        $help = 1;
+    }
+    elsif ($pl_line =~ m/^show/) {
+        @pl_temp = split(' ', $pl_line, 2);
+        if (defined($pl_temp[1])) {
+            $show = $pl_temp[1];
+        }
+        else {
+            $show = "EVERYTHING";
+        }
+    }
+    elsif ($pl_line =~ m/^base/) {
+        @pl_temp = split(' ', $pl_line, 2);
+        if (defined($pl_temp[1])) {
+            $searchbase = $pl_temp[1];
+        }
+        else {
+            $searchbase = "";
+        }
+    }
+    elsif ($pl_line =~ m/^filter/) {
+        @pl_temp = split(' ', $pl_line, 2);
+        if (defined($pl_temp[1])) {
+            $filter = $pl_temp[1];
+        }
+        else {
+            $filter = "";
+        }
+    }
+    elsif ($pl_line =~ m/^value/) {
+        @pl_temp = split(' ', $pl_line, 2);
+        if (defined($pl_temp[1])) {
+            $value = $pl_temp[1];
+        }
+        else {
+            $value = "";
+        }
+    }
+    # possible 3 part lines
+    elsif ($pl_line =~ m/^add/ ) {
+        $optype = "add";
+        @pl_temp = split(' ', $pl_line, 3);
+        if (defined($pl_temp[2])) {
+            $value = $pl_temp[2];
+            $runnow = 1;
+        }
+        if (defined($pl_temp[1])) {
+            $attrib = $pl_temp[1];
+        }
+    }
+    elsif ($pl_line =~ m/^rep/ ) {
+        $optype = "rep";
+        @pl_temp = split(' ', $pl_line, 3);
+        if (defined($pl_temp[2])) {
+            $value = $pl_temp[2];
+            $runnow = 1;
+        }
+        if (defined($pl_temp[1])) {
+            $attrib = $pl_temp[1];
+        }
+    }
+    elsif ($pl_line =~ m/^del/ ) {
+        $optype = "del";
+        @pl_temp = split(' ', $pl_line, 3);
+        if (defined($pl_temp[2])) {
+            $value = $pl_temp[2];
+            $runnow = 1;
+        }
+        if (defined($pl_temp[1])) {
+            $attrib = $pl_temp[1];
+        }
+    }
+    else {
+        print "I don't understand what you typed.\n";
+    }
+}
+
+sub do_job {
+    my %att_hash = ();
+    my $dntemp = "";
+    &do_bind();
+    $matches = $ldap->search(
+        base => "$searchbase",
+        filter => "$filter"
+        );
+    if ($matches->code) { 
+        printf(STDERR "Error: %s\n", ldap_error_name($matches->code));
+        print STDERR ldap_error_text($matches->code) . "\n";
+        return -1;
+    }
+    if ($matches->count < 1) {
+        print "No matches found!\n";
+        return 0;
+    }
+    if ($matches->count > 1) {
+        print "\n";
+        printf "WARNING! filter matches %d entries.\n", $matches->count;
+        print "\n";
+        print "Would you like to see the list? (y/n): ";
+        my $reply = <STDIN>;
+        if ($reply =~ m/^Y/i) {
+            print "\n";
+            foreach $entry ($matches->all_entries) {
+                $dntemp = $entry->dn();
+                print "$dntemp\n";
+            } 
+            print "\n";
+        }
+        print "Do you really want to modify all these entries? ".
+            "(yes/no) ";
+        $reply = <STDIN>;
+        chomp($reply);
+        unless ($reply =~ m/^yes$/) {
+            return 0;
+        }
+    }
+
+    #
+    # Make our attribute hash for the modification
+    #
+    if ($value) {
+        $att_hash{$attrib} = $value;
+    }
+    else {
+        $att_hash{$attrib} = [];
+    }
+    foreach $entry ($matches->all_entries) {
+        $dntemp = $entry->dn();
+        print "Modifying $dntemp\n";
+        if ($optype eq "add") {
+            $mesg = $ldap->modify( $entry, add => \%att_hash );
+        }
+        elsif ($optype eq "rep") {
+            $mesg = $ldap->modify( $entry, replace => \%att_hash );
+        }
+        elsif ($optype eq "del") {
+            $mesg = $ldap->modify( $entry, delete => \%att_hash );
+        }
+        if ($mesg->code != 0) { 
+            printf(STDERR "Error: %s\n", ldap_error_name($matches->code));
+            print STDERR ldap_error_text($matches->code) . "\n";
+        }
+        else {
+            print ldap_error_desc($matches->code) . ": ";
+            print ldap_error_text($matches->code) . "\n";
+        }
+    }
+    $ldap->unbind;
+    $ldap->disconnect;
+}
+
+sub do_show {
+    &do_bind();
+    if ("$show" eq "EVERYTHING") {
+        $matches = $ldap->search(
+            base => "$searchbase",
+            filter => "$filter"
+            );
+    }
+    else {
+        my @show_attrs = split(' ',$show);
+        $matches = $ldap->search(
+            base => "$searchbase",
+            filter => "$filter",
+            attrs => \@show_attrs
+            );
+    }
+    if ($matches->code) { 
+        printf(STDERR "Error: %s\n", ldap_error_name($matches->code));
+        print STDERR ldap_error_text($matches->code) . "\n";
+        return -1;
+    }
+    else {
+        print ldap_error_desc($matches->code) . ": ";
+        print ldap_error_text($matches->code) . "\n";
+    }
+    if ($matches->count <1) {
+        print "No matches found!\n";
+        return 0;
+    }
+    if ($pager) {
+       open(SHOWOUT, "|$pager") or die "Cant exec $pager\n";
+       $ldif = Net::LDAP::LDIF->new(\*SHOWOUT,"w");
+       $ldif->write($matches->all_entries);
+       close(SHOWOUT);
+       $ldif->done;
+    }
+    else {
+       $ldif = Net::LDAP::LDIF->new(\*STDOUT,"w");
+       $ldif->write($matches->all_entries);
+       $ldif->done;
+    }
+    $ldap->unbind;
+    $ldap->disconnect;
+}
+
+sub print_cli_usage {
+    print "\nUsage: lmod [-h host][-b searchbase][filter][operation][attribute][value]\n".
+        "    where filter is a valid key=value LDAP filter. (complex filters allowed)\n".
+        "    and operation is add, rep (replace), or del (delete).\n".
+        "    If insufficient arguments are provided interactive mode will be used.\n\n";
+}
+
+sub print_help {
+    print "Available commands are:\n".
+        "    quit or exit\n".
+        "    show <attribute>        Display entries matching filter\n".
+        "    run                     Execute operation\n".
+        "    base <search base>      Set/unset the searchbase\n".
+        "    filter <ldap filter>    Set/unset the search filter\n".
+        "    value <attrib value>    Set/unset the attribute value\n".
+        "    add <attribute> <value> Add attribute\n".
+        "    rep <attribute> <value> Replace attribute\n".
+        "    del <attribute> <value> Delete attribute\n".
+        "    help                    Repeat this help screen\n".
+        "If add, rep, or del are given with both arguments the operation\n".
+        "will execute immediately, otherwise you must enter run when\n".
+        "ready.  You will be prompted for confirmation if your filter\n".
+        "matches more than one entry.\n\n";
+}
+
+sub print_vars {
+    print "Current Variables:\n";
+    print  " base:      $searchbase\n";
+    printf " filter:    %s\n", ($filter||"No Value");
+    printf " operation: %s\n", ($optype||"No Value");
+    printf " attrib:    %s\n", ($attrib||"No Value");
+    printf " value:     %s\n", ($value||"No Value");
+    print "\n";
+}
+
+sub got_job {
+    # do we have enough vars to perform an operation?
+    if ( ("$optype" =~ m/add/)&&
+         ($searchbase)&&
+         ($filter)&&
+         ($attrib)&&
+         ($value) )
+    {
+        return 1;
+    }
+    if ( ("$optype" =~ m/rep/)&&
+         ($searchbase)&&
+         ($filter)&&
+         ($attrib)&&
+         ($value) )
+    {
+        return 2;
+    }
+    if ( ("$optype" =~ m/del/)&&
+         ($searchbase)&&
+         ($filter)&&
+         ($attrib) )
+    {
+        return 3;
+    }
+    # otherwise
+    return 0;
+}
+
+sub get_cred {
+    # get our bind credentials from rc file or the user.
+    # being lazy though and seting them in global vars
+    # rather than making this a real function.
+    #
+    # expected global vars are $binddn $bindpass $searchbase 
+
+    my $gc_reply = "";
+    my $gc_ldap = "";
+    my $gc_search = "";
+    my $gc_entry = "";
+
+    print STDERR "Checking for credentials in rcfile.\n";
+
+    $binddn = &getrcval("BINDDN");
+    $bindpass = &getrcval("BINDPASS");
+
+    unless (defined($binddn))
+    {
+        print STDERR "No credentials found.\n";
+        if ("$searchbase" ne "") {
+            print STDERR "Prompting user.\n\n";
+        }
+        else {
+            die("Can't set credentials interactively without a searchbase!\n");
+        }
+
+        print "Please enter your userid: ";
+        chomp($gc_reply = <STDIN>);
+        $gc_ldap = Net::LDAP->new("$ldaphost")
+            or die("Cant connect to $ldaphost: $!\n");
+        # debug
+        print "base: $searchbase\nfilter: uid=$gc_reply\n";
+        $gc_search = $gc_ldap->search(
+            base => "$searchbase",
+            filter => "uid=$gc_reply"
+            );
+        if ($gc_search->count) {
+            $gc_entry = $gc_search->shift_entry();
+            $binddn = $gc_entry->dn();
+        }
+        else {
+            print STDERR "No such user found: $gc_reply\n\n";
+            exit;
+        }
+        $gc_ldap->unbind;
+        $gc_ldap->disconnect;
+    }
+    unless (defined($bindpass)) {
+        print "Enter password for \n$binddn\n  ? ";
+        system("stty -echo");
+        chomp($bindpass = <STDIN>);
+        system("stty echo");
+        print "\n\n";
+    }
+}
+
+sub do_bind {
+    # expects global vars: $ldap $ldaphost $binddn $bindpass
+    print "* Connecting to $ldaphost\n";
+    # sleep 2;
+    $ldap = Net::LDAP->new("$ldaphost") 
+        or die("Cant connect to $ldaphost: $!\n");
+    my $dse = $ldap->root_dse();
+    my $hastls = $dse->supported_extension(LDAP_EXTENSION_START_TLS);
+    if ($hastls) {
+        print "* Starting TLS\n";
+        my $tlsmsg = $ldap->start_tls(verify => 'none');
+        if ($tlsmsg->is_error) { 
+            die $tlsmsg->error; 
+        } 
+        # print ldap_error_name($tlsmsg->code) . "\n";
+        print ldap_error_desc($tlsmsg->code) . ": ";
+        print ldap_error_text($tlsmsg->code) . "\n";
+    }
+    else {
+        print "Server does not support TLS, using unencrypted connection.\n";
+    }
+    print "* Binding as $binddn\n";
+    my $mesg = $ldap->bind(
+        dn => "$binddn",
+        password => "$bindpass"
+        );
+    if ($mesg->code) {
+        die $mesg->error;
+    }
+    # print ldap_error_name($mesg->code) . "\n";
+    print ldap_error_desc($mesg->code) . ": ";
+    print ldap_error_text($mesg->code) . "\n";
+}
+
+sub getrcval {
+    my $chkkey = shift(@_);
+    my %values = (); 
+    my $key = ""; 
+    my $val = ""; 
+    my $rcfile = "";
+    my $line = "";
+
+    if (("$hostarg" ne "")&&( -f "$configbase.$hostarg")&&( -r "$configbase.$hostarg")) {
+        $rcfile = "$configbase.$hostarg";
+        print "Using rc file: $rcfile\n";
+    }
+    elsif ((-f $configbase)&&( -r $configbase)) {
+        $rcfile = $configbase;
+        print "Using rc file: $rcfile\n";
+    } 
+    else {
+        return undef;
+    }
+
+    open (RCFILE, "<$rcfile") or die "Unexpected error opening $rcfile\n";
+    while (<RCFILE>) {
+        $line = $_;
+        chomp $line;
+        next if ($line =~ m/^#/);
+        next if ($line !~ m/:/);
+        ($key, $val) = split(/:/, $line, 2);
+        $values{$key} = $val;
+    }
+
+    if (defined $values{$chkkey}) {
+        return $values{$chkkey};
+    }   
+    else {
+        return undef;
+    }
+}
+

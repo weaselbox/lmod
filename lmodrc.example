@@ -1,0 +1,4 @@
+LDAPHOST:ldap.example.com
+LDAPBASE:dc=example,dc=com
+BINDDN:uid=some_dude,ou=people,dc=example,dc=com
+BINDPASS:pa55w0rd!
